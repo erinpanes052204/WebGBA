@@ -1,0 +1,7 @@
+{
+  "name": "webgba-tests",
+  "private": true,
+  "description": "Browser regression tests for WebGBA",
+  "scripts": { "test": "node run.js" },
+  "dependencies": { "puppeteer": "^23.0.0" }
+}

@@ -3,7 +3,7 @@
 A Game Boy Advance emulator that runs entirely in your browser. The emulation is
 [mGBA](https://mgba.io) 0.10.5 compiled to WebAssembly; the interface is React.
 
-**Play:** https://erinpanes052204.github.io/WebGBA/
+**Play:** `https://YOUR-USERNAME.github.io/YOUR-REPO/` (replace with your own link)
 
 - **Bring your own games.** No ROMs, BIOS files or cover art are included or ever will be.
   Use only games you own.
@@ -20,4 +20,12 @@ A Game Boy Advance emulator that runs entirely in your browser. The emulation is
 
 ### Verify the binary
 `core/mgba.wasm` SHA-256:
-`07108af52f45b53943f76074102a86931cb096647447844ad2ddaadb4a2b36ea`
+`a646127e709cbd4c778fc26820b54eedbbc36975e771c58865f616ed98780e47`
+
+It was rebuilt from scratch with `build/build-core.sh` on Ubuntu 24.04 (Emscripten 3.1.6 from the
+distro package, `emscripten 3.1.6~dfsg-7`) and the result was byte-for-byte identical. A different
+Emscripten version may produce a different (but equivalent) file.
+
+## Tests
+`cd tests && npm install && node run.js` runs 14 browser tests (saves, imports, backups, phone layout, ...)
+against a real headless Chrome using generated test ROMs. `.github/workflows/test.yml` runs them on every push.

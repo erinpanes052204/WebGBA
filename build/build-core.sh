@@ -22,4 +22,4 @@ emcc -O3 -flto -I"$WORK/mgba-0.10.5/include" -I"$PWD/include" -D_GNU_SOURCE -DDI
   -sMODULARIZE=1 -sEXPORT_NAME=createMgba -sENVIRONMENT=web -sALLOW_MEMORY_GROWTH=1 \
   -sINITIAL_MEMORY=64MB -sFILESYSTEM=0 -sEXPORTED_RUNTIME_METHODS=ccall
 cp "$HERE/mgba.js" "$HERE/mgba.wasm" "$HERE/../core/"
-echo "Done: core/mgba.js and core/mgba.wasm were rebuilt."
+echo "Done. rebuilt core/mgba.js and core/mgba.wasm"

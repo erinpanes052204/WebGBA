@@ -35,7 +35,8 @@ const R = { kbd: 0, pad: 0, touch: 0, acc: 0, last: 0, frames: 0, fpsAt: 0, dirt
   lastSave: null, lastRom: null, codes: {}, overlayPaused: false, autoPaused: false, dec: { n: 0, l: 0, r: 0 },
   glowAt: 0, gc: null, canvas: null, ctx: null, drag: 0,
   input: 0, combo: false, rep: {}, padPrev: new Set(), nav: { active: false, handler: null }, menuCb: null,
-  turboSticky: false, turboKbd: false, turboPad: false, listen: null, listenT: 0, coverT: 0 };
+  turboSticky: false, turboKbd: false, turboPad: false, listen: null, listenT: 0, coverT: 0,
+  importing: false, chain: Promise.resolve(), saveFails: 0 };
 const glowCanvas = document.createElement('canvas'); glowCanvas.width = 4; glowCanvas.height = 3;
 const gctx = glowCanvas.getContext('2d', { willReadFrequently: true });
 
@@ -136,7 +137,11 @@ function rebuildKeys() { R.codes = {}; for (const [a, c] of Object.entries(state
 function commitConfig(c, persist = true) {
   set({ config: c }); rebuildKeys(); applyVolume();
   if (!persist) return;
-  clearTimeout(cfgT); cfgT = setTimeout(() => store.putConfig(c).catch((e) => console.warn('config not saved', e)), 400);
+  persistConfig();
+}
+function persistConfig(delay = 400) {   // always writes the LATEST config, and retries if the disk/server hiccups
+  clearTimeout(cfgT);
+  cfgT = setTimeout(async () => { try { await store.putConfig(state.config); } catch (e) { console.warn('config not saved, retrying', e); persistConfig(5000); } }, delay);
 }
 function updateConfig(fn) { const c = structuredClone(state.config); fn(c); commitConfig(c); }
 /* Everything read from a config file or backup zip is untrusted: keep only known keys, clamp numbers,
@@ -180,14 +185,15 @@ const Core = {
   m: null,
   async init() { this.m = await createMgba({ locateFile: (f) => 'core/' + f }); },
   heap() { return this.m.HEAPU8; },
-  put(bytes) { const p = this.m._wg_alloc(bytes.length); this.m.HEAPU8.set(bytes, p); return p; },
+  put(bytes) { const p = this.m._wg_alloc(bytes.length); if (!p) throw new Error('Out of memory'); this.m.HEAPU8.set(bytes, p); return p; },
   load(rom, save, bios) {
     const m = this.m;
     if (bios) { const p = this.put(bios); m._wg_set_bios(p, bios.length); m._wg_free(p); } else m._wg_set_bios(0, 0);
-    if (save) { const p = this.put(save); m._wg_set_pending_save(p, save.length); m._wg_free(p); } else m._wg_set_pending_save(0, 0);
+    if (save) { const p = this.put(save), ok = m._wg_set_pending_save(p, save.length); m._wg_free(p); if (!ok) return false; }   // never start with the wrong (blank) save
+    else m._wg_set_pending_save(0, 0);
     const p = this.put(rom), ok = m._wg_load_rom(p, rom.length);
     m._wg_free(p);
-    return !!ok;
+    return !!ok;     // on failure the game that was already running is untouched
   },
   frame(keys) { this.m._wg_set_keys(keys); this.m._wg_run_frame(); },
   video() { return new Uint8ClampedArray(this.heap().buffer, this.m._wg_video_ptr(), W * H * 4); },
@@ -423,25 +429,31 @@ async function zipEntries(file) {
   let e = tl - 22; while (e >= 0 && tail.getUint32(e, true) !== 0x06054b50) e--;
   if (e < 0) throw new Error('not a valid zip');
   const count = tail.getUint16(e + 10, true), cdSize = tail.getUint32(e + 12, true), cdOff = tail.getUint32(e + 16, true);
+  if (count > 20000 || cdOff + cdSize > file.size) throw new Error('zip looks corrupted or has too many files');
   const cd = new DataView(await file.slice(cdOff, cdOff + cdSize).arrayBuffer()), dec = new TextDecoder(), out = [];
   let p = 0;
   for (let i = 0; i < count && p + 46 <= cd.byteLength; i++) {
     if (cd.getUint32(p, true) !== 0x02014b50) break;
     const nl = cd.getUint16(p + 28, true), el = cd.getUint16(p + 30, true), cl = cd.getUint16(p + 32, true);
-    out.push({ method: cd.getUint16(p + 10, true), csize: cd.getUint32(p + 20, true), usize: cd.getUint32(p + 24, true), lho: cd.getUint32(p + 42, true),
+    out.push({ method: cd.getUint16(p + 10, true), csize: cd.getUint32(p + 20, true), usize: cd.getUint32(p + 24, true), crc: cd.getUint32(p + 16, true), flags: cd.getUint16(p + 8, true), lho: cd.getUint32(p + 42, true),
       name: dec.decode(new Uint8Array(cd.buffer, p + 46, nl)) });
     p += 46 + nl + el + cl;
   }
   return out;
 }
 async function zipRead(file, e) {
+  if (e.flags & 1) throw new Error('encrypted zip files are not supported');
+  if (e.csize === 0xFFFFFFFF || e.usize === 0xFFFFFFFF) throw new Error('zip64 files are not supported');
   if (e.csize > ZIP_LIMIT || e.usize > ZIP_LIMIT) throw new Error('a file inside the zip is too large');
   const lh = new DataView(await file.slice(e.lho, e.lho + 30).arrayBuffer());
+  if (lh.byteLength < 30 || lh.getUint32(0, true) !== 0x04034b50) throw new Error('zip entry is corrupted');
   const start = e.lho + 30 + lh.getUint16(26, true) + lh.getUint16(28, true);
+  if (start + e.csize > file.size) throw new Error('zip entry is truncated');
   const raw = new Uint8Array(await file.slice(start, start + e.csize).arrayBuffer());
-  if (e.method === 0) return raw;
-  if (e.method === 8) return inflateRaw(raw);
-  throw new Error('unsupported zip compression');
+  let out;
+  if (e.method === 0) out = raw; else if (e.method === 8) out = await inflateRaw(raw); else throw new Error('unsupported zip compression');
+  if (out.length !== e.usize || crc32(out) !== e.crc) throw new Error('zip entry failed its checksum (the file is corrupted)');
+  return out;
 }
 class ZipWriter {
   constructor() { this.parts = []; this.cd = []; this.off = 0; }
@@ -487,12 +499,30 @@ function download(name, data, type = 'application/octet-stream') {
 }
 
 /* ------------------------------------------------------------------ ROM loading */
-function romId(rom) {
+const looksLikeGba = (b) => b.length >= 0xC0 && b[0xB2] === 0x96;   // fixed marker byte in every GBA cartridge header
+function romHeader(rom) {
   const txt = (a, b) => String.fromCharCode(...rom.subarray(a, b)).replace(/[^A-Za-z0-9]/g, '');
-  const code = txt(0xAC, 0xB0), title = txt(0xA0, 0xAC);
+  return { code: txt(0xAC, 0xB0), title: txt(0xA0, 0xAC) };
+}
+function legacyRomId(rom) {   // ids used by earlier versions (header only); kept so old saves are found and migrated
+  const { code, title } = romHeader(rom);
   if (code.length === 4) return `${code}_${title}`.slice(0, 40);
   let h = 2166136261; for (let i = 0; i < rom.length; i += 17) h = Math.imul(h ^ rom[i], 16777619);
   return 'rom_' + (h >>> 0).toString(16);
+}
+function romId(rom) {         // header + CRC32 of the whole file, so two different ROMs never share a save
+  const { code, title } = romHeader(rom), crc = crc32(rom).toString(16).padStart(8, '0');
+  return code.length === 4 ? `${code}_${title}_${crc}` : 'rom_' + crc;
+}
+async function migrateLegacy(id, legacy) {   // copy states, thumbnails and cheats from the old id (copy, never delete)
+  if (id === legacy) return;
+  const c = state.config, old = c.meta[legacy];
+  if (c.meta[id] || c.cheats[id] != null || (!old && c.cheats[legacy] == null)) return;
+  for (const n of [1, 2, 3, 4]) {
+    if (!(old && old[n])) continue;
+    try { const b = await store.get('state', `${legacy}/${n}`); if (b) await store.put('state', `${id}/${n}`, b); } catch (e) { console.warn(e); }
+  }
+  updateConfig((cf) => { if (cf.meta[legacy]) cf.meta[id] = structuredClone(cf.meta[legacy]); if (cf.cheats[legacy] != null) cf.cheats[id] = cf.cheats[legacy]; });
 }
 async function openFile(file) {
   try {
@@ -503,6 +533,7 @@ async function openFile(file) {
       if (!e) throw new Error('no .gba file inside the zip');
       bytes = await zipRead(file, e); name = e.name.split('/').pop();
     } else bytes = new Uint8Array(await file.arrayBuffer());
+    if (!looksLikeGba(bytes) && !confirm("This file doesn't look like a Game Boy Advance game (its header marker is missing).\nTry to run it anyway?")) return;
     if (await startRom(bytes, name)) await saveToLibrary(name, bytes);   // "open 1 game and save it"
   } catch (err) { toast('Could not open: ' + err.message); }
 }
@@ -518,17 +549,20 @@ async function openLibrary(name) {
 async function startRom(rom, name) {
   if (!Core.m) { toast('Emulator core is still loading, try again in a moment'); return false; }
   if (rom.length < 0xC0 || rom.length > 32 * 1024 * 1024) { toast('That does not look like a GBA ROM'); return false; }
-  R.lastRom = { bytes: rom, name };
   await saveSaveNow(); await ensureAudio();
-  const id = romId(rom); let save = null, bios = null;
+  const id = romId(rom), legacy = legacyRomId(rom); let save = null, bios = null;
   try { save = await store.get('save', id); } catch (e) { console.warn(e); }
+  if (!save && legacy !== id) {   // a save from before ids included the ROM checksum
+    try { save = await store.get('save', legacy); if (save) await store.put('save', id, save); } catch (e) { console.warn(e); }
+  }
   try { const b = await idbGet('bios:gba'); bios = b ? new Uint8Array(b) : null; } catch (e) { /* optional */ }
   if (!Core.load(rom, save, bios)) { toast('mGBA rejected this ROM'); return false; }
-  Object.assign(R, { lastSave: save, acc: 0, frames: 0, fpsAt: performance.now(), dec: { n: 0, l: 0, r: 0 }, overlayPaused: false, autoPaused: false });
+  Object.assign(R, { lastRom: { bytes: rom, name }, lastSave: save, acc: 0, frames: 0, fpsAt: performance.now(), dec: { n: 0, l: 0, r: 0 }, overlayPaused: false, autoPaused: false });
   const title = String.fromCharCode(...rom.subarray(0xA0, 0xAC)).replace(/\0/g, '').trim() || name.replace(/\.[^.]+$/, '');
   R.turboSticky = false; R.turboKbd = false;
   set({ running: true, paused: false, turbo: false, id, romName: name, title });
   document.title = title + ' | WebGBA';
+  await migrateLegacy(id, legacy);
   if ((state.config.cheats[id] || '').trim()) applyCheats(state.config.cheats[id], true);
   clearTimeout(R.coverT); R.coverT = setTimeout(captureCover, 8000);
   return true;
@@ -582,7 +616,7 @@ async function importFiles(files) {
         if (file.size < 0xC0 || file.size > 32 * 1024 * 1024) { skipped++; continue; }
         bytes = new Uint8Array(await file.arrayBuffer());
       }
-      if (/\.bin$/i.test(name) && bytes[0xB2] !== 0x96) { skipped++; continue; }   // .bin is ambiguous: require the GBA header marker
+      if (!looksLikeGba(bytes)) { skipped++; continue; }                          // not a GBA game (random data, other consoles)
       if (have.get(name) === bytes.length) continue;                              // already in your games
       await Library.add(name, bytes); have.set(name, bytes.length); added++;
     } catch (e) { skipped++; }
@@ -608,13 +642,15 @@ function captureCover() {   // the tile art is a screenshot of your own game
 /* ----------------------------------------------------------------- saves, states */
 const isBlank = (d) => { for (let i = 0; i < d.length; i++) if (d[i] !== 0xFF) return false; return true; };
 const same = (a, b) => a && b && a.length === b.length && a.every((v, i) => v === b[i]);
-async function saveSaveNow() {
-  if (!state.running || !state.id) return;
+async function doSave() {
+  const id = state.id;
+  if (!state.running || !id || R.importing) return;
   const d = Core.saveData();
   if (!d || isBlank(d) || same(d, R.lastSave)) return;
-  R.lastSave = d;
-  try { await store.put('save', state.id, d); } catch (e) { toast('Could not write save: ' + e.message); }
+  try { await store.put('save', id, d); if (state.id === id) R.lastSave = d; R.saveFails = 0; }
+  catch (e) { if (R.saveFails++ % 15 === 0) toast('Could not write your save, retrying: ' + e.message); }   // lastSave is NOT updated, so the next tick retries
 }
+const saveSaveNow = () => (R.chain = R.chain.then(doSave, doSave));
 setInterval(saveSaveNow, 2000);
 addEventListener('pagehide', saveSaveNow);
 document.addEventListener('visibilitychange', () => {
@@ -658,8 +694,13 @@ function applyCheats(text, silent) {
 const exportSav = () => { const d = Core.saveData(); d ? download((state.title || 'game') + '.sav', d) : toast('No save data yet'); };
 async function importSav(file) {
   if (!state.running) return;
-  try { const b = new Uint8Array(await file.arrayBuffer()); await store.put('save', state.id, b); R.lastSave = b; toast('Save imported. Restarting game...'); await startRom(R.lastRom.bytes, R.lastRom.name); }
-  catch (e) { toast('Import failed: ' + e.message); }
+  if (![512, 8192, 32768, 65536, 131072].includes(file.size)) { toast('That does not look like a GBA save (expected 512 B, 8, 32, 64 or 128 KB)'); return; }
+  R.importing = true;   // pauses autosave, so the old in-memory save can't overwrite the imported file
+  try {
+    const b = new Uint8Array(await file.arrayBuffer());
+    await store.put('save', state.id, b); toast('Save imported. Restarting game...');
+    await startRom(R.lastRom.bytes, R.lastRom.name);
+  } catch (e) { toast('Import failed: ' + e.message); } finally { R.importing = false; }
 }
 
 /* ---------------------------------------------------------------------- controls */
@@ -702,25 +743,27 @@ async function exportBackup({ roms = false } = {}) {
   } catch (e) { toast('Backup failed: ' + e.message); } finally { set({ busy: null }); }
 }
 async function importBackup(file) {
-  set({ busy: 'Reading backup...' });
-  const n = { saves: 0, states: 0, roms: 0, skipped: 0 };
+  set({ busy: 'Reading backup...' }); R.importing = true;
+  const n = { saves: 0, states: 0, roms: 0, skipped: 0 }, restored = new Set();
   try {
     const ents = await zipEntries(file); let cfg = null, i = 0;
+    if (ents.reduce((t, e) => t + (e.usize || 0), 0) > 2 * 1024 ** 3) throw new Error('backup is larger than 2 GB');
     for (const e of ents) {
       set({ busy: `Restoring ${++i}/${ents.length}` });
       if (e.name.endsWith('/') || e.name.includes('..') || e.name.startsWith('/')) continue;
       let m;
       if (e.name === 'settings.json') cfg = JSON.parse(new TextDecoder().decode(await zipRead(file, e)));
-      else if ((m = /^saves\/([A-Za-z0-9_.-]{1,96})\.sav$/.exec(e.name))) { await store.put('save', m[1], await zipRead(file, e)); n.saves++; }
+      else if ((m = /^saves\/([A-Za-z0-9_.-]{1,96})\.sav$/.exec(e.name))) { await store.put('save', m[1], await zipRead(file, e)); restored.add(m[1]); n.saves++; }
       else if ((m = /^states\/([A-Za-z0-9_.-]{1,96})\/([A-Za-z0-9_.-]{1,16})\.state$/.exec(e.name))) { await store.put('state', `${m[1]}/${m[2]}`, await zipRead(file, e)); n.states++; }
       else if ((m = /^roms\/([^/\\]+)$/.exec(e.name))) {
-        if (ROM_RE.test(m[1])) { try { await Library.add(m[1], await zipRead(file, e)); n.roms++; } catch (err) { n.skipped++; } } else n.skipped++;
+        if (ROM_RE.test(m[1])) { try { const b = await zipRead(file, e); if (looksLikeGba(b)) { await Library.add(m[1], b); n.roms++; } else n.skipped++; } catch (err) { n.skipped++; } } else n.skipped++;
       }
     }
     if (cfg) commitConfig(mergeConfig(cfg));
     await refreshLibrary();
+    if (state.running && restored.has(state.id) && R.lastRom) await startRom(R.lastRom.bytes, R.lastRom.name);   // pick up the restored save
     toast(`Restored ${n.saves} saves, ${n.states} states, ${n.roms} games${n.skipped ? ` (${n.skipped} games skipped)` : ''}`);
-  } catch (e) { toast('Restore failed: ' + e.message); } finally { set({ busy: null }); }
+  } catch (e) { toast('Restore failed: ' + e.message); } finally { R.importing = false; set({ busy: null }); }
 }
 
 /* -------------------------------------------------------------- drag and drop */
@@ -753,6 +796,6 @@ window.GBA = {
   setMenu: (fn) => { R.menuCb = fn; },                              // called on Select + Start
   setBios, clearBios, exportBackup, importBackup, touchSet,
   _debug: () => ({ level: R.level, turbo: state.turbo, frames: R.frames, nav: R.nav.active }),
-  _import: importFiles,
+  _import: importFiles, _store: store, _core: Core,   // test hooks
 };
 })();

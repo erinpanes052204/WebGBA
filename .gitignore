@@ -1,0 +1,15 @@
+# never commit games, saves or backups
+server/target/
+server/data/
+server/roms/*
+!server/roms/README.txt
+*.gba
+*.agb
+*.mb
+*.sav
+*.srm
+*.state
+webgba-backup-*.zip
+core/_build/
+
+tests/node_modules/
