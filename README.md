@@ -3,7 +3,7 @@
 A Game Boy Advance emulator that runs entirely in your browser. The emulation is
 [mGBA](https://mgba.io) 0.10.5 compiled to WebAssembly; the interface is React.
 
-**Play:** `https://YOUR-USERNAME.github.io/YOUR-REPO/` (replace with your own link)
+**Play:** https://erinpanes052204.github.io/WebGBA/
 
 - **Bring your own games.** No ROMs, BIOS files or cover art are included or ever will be.
   Use only games you own.
