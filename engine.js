@@ -13,7 +13,8 @@ const DEFAULT_KEYS = {
 const DEFAULT_PAD = { A: 1, B: 0, L: 4, R: 5, START: 9, SELECT: 8, UP: 12, DOWN: 13, LEFT: 14, RIGHT: 15, TURBO: 2, SAVE: 3, LOAD: 6, SLOT: 7, PAUSE: -1 };
 const defaults = () => ({
   v: 1,
-  settings: { vol: 70, filter: 'sharp', scale: 'fit', pauseHidden: true, turboSpeed: 4, turboAudio: 'fast', glow: true, touch: 'auto', slot: 1 },
+  settings: { vol: 70, filter: 'sharp', scale: 'fit', pauseHidden: true, turboSpeed: 4, turboAudio: 'fast', glow: true, touch: 'auto', slot: 1,
+    toolbar: 'middle', btnSize: 'normal', screenFit: 'fit', vibrate: true },
   keys: { ...DEFAULT_KEYS }, pad: { ...DEFAULT_PAD }, cheats: {}, meta: {}, covers: {},
 });
 const FRAME_MS = 1000 / 59.7275;
@@ -29,7 +30,10 @@ let state = {
 const subs = new Set();
 const set = (p) => { state = { ...state, ...p }; subs.forEach((f) => f()); };
 let toastT;
-function toast(msg) { set({ toast: { msg, id: Date.now() } }); clearTimeout(toastT); toastT = setTimeout(() => set({ toast: null }), 2600); }
+function toast(msg, action) {   // action = { label, fn }: a button on the toast (used for Undo)
+  set({ toast: { msg, id: Date.now(), action: action || null } });
+  clearTimeout(toastT); toastT = setTimeout(() => set({ toast: null }), action ? 6000 : 2600);
+}
 
 const R = { kbd: 0, pad: 0, touch: 0, acc: 0, last: 0, frames: 0, fpsAt: 0, dirty: false, audio: null, level: 0,
   lastSave: null, lastRom: null, codes: {}, overlayPaused: false, autoPaused: false, dec: { n: 0, l: 0, r: 0 },
@@ -77,6 +81,10 @@ const store = {
       const r = await fetch(this.url(kind, key), { method: 'PUT', body: bytes });
       if (!r.ok) throw new Error('server refused write');
     } else await idbPut(`${kind}:${key}`, bytes);
+  },
+  async del(kind, key) {
+    if (this.server) { const r = await fetch(this.url(kind, key), { method: 'DELETE' }); if (!r.ok && r.status !== 204) throw new Error('server refused delete'); return; }
+    await idbDel(`${kind}:${key}`);
   },
   async list() {
     if (this.server) return (await fetch('/api/data')).json();
@@ -146,7 +154,8 @@ function persistConfig(delay = 400) {   // always writes the LATEST config, and 
 function updateConfig(fn) { const c = structuredClone(state.config); fn(c); commitConfig(c); }
 /* Everything read from a config file or backup zip is untrusted: keep only known keys, clamp numbers,
    and only accept our own jpeg/png data URLs for images (so a doctored backup can't make the page fetch anything). */
-const CHOICES = { filter: ['sharp', 'smooth', 'lcd'], scale: ['fit', '2', '3', '4', '5'], turboAudio: ['fast', 'mute'], touch: ['auto', 'on', 'off'] };
+const CHOICES = { filter: ['sharp', 'smooth', 'lcd'], scale: ['fit', '2', '3', '4', '5'], turboAudio: ['fast', 'mute'], touch: ['auto', 'on', 'off'],
+  toolbar: ['middle', 'top'], btnSize: ['normal', 'large'], screenFit: ['fit', 'stretch'] };
 const badKey = (k) => k === '__proto__' || k === 'constructor' || k === 'prototype' || k.length > 200;
 const isImg = (u) => typeof u === 'string' && u.length < 200000 && /^data:image\/(jpeg|png);base64,[A-Za-z0-9+/=]+$/.test(u);
 function mergeConfig(raw) {
@@ -156,7 +165,7 @@ function mergeConfig(raw) {
   const settings = { ...d.settings };
   settings.vol = num(rs.vol, 0, 100, 70); settings.turboSpeed = num(rs.turboSpeed, 2, 16, 4); settings.slot = num(rs.slot, 1, 4, 1);
   for (const k of Object.keys(CHOICES)) settings[k] = CHOICES[k].includes(rs[k]) ? rs[k] : d.settings[k];
-  settings.pauseHidden = rs.pauseHidden !== false; settings.glow = rs.glow !== false;
+  settings.pauseHidden = rs.pauseHidden !== false; settings.glow = rs.glow !== false; settings.vibrate = rs.vibrate !== false;
   const keys = { ...d.keys }, pad = { ...d.pad };
   for (const a of Object.keys(d.keys)) if (raw.keys && typeof raw.keys[a] === 'string' && raw.keys[a].length < 32) keys[a] = raw.keys[a];
   for (const a of Object.keys(d.pad)) if (raw.pad && Number.isInteger(raw.pad[a]) && raw.pad[a] >= -1 && raw.pad[a] < 32) pad[a] = raw.pad[a];
@@ -228,6 +237,7 @@ registerProcessor('gba-audio', P);`;
 async function ensureAudio() {
   if (R.audio) { if (R.audio.ctx.state === 'suspended') R.audio.ctx.resume(); return; }
   try {
+    try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) { /* iOS 17+: otherwise the silent switch mutes the game */ }
     const ctx = new AudioContext({ sampleRate: Core.m._wg_sample_rate(), latencyHint: 'interactive' });
     await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], { type: 'text/javascript' })));
     const node = new AudioWorkletNode(ctx, 'gba-audio', { outputChannelCount: [2] }), gain = ctx.createGain();
@@ -659,26 +669,45 @@ document.addEventListener('visibilitychange', () => {
     if (state.config.settings.pauseHidden && state.running && !state.paused) { set({ paused: true }); R.autoPaused = true; }
   } else if (R.autoPaused) { set({ paused: false }); R.autoPaused = false; }
 });
-async function saveState(n) {
+async function saveState(n = curSlot()) {
   if (!state.running) return;
   const st = Core.stateSave();
   if (!st) { toast('Save state failed'); return; }
+  const id = state.id, key = `${id}/${n}`;
   try {
-    await store.put('state', `${state.id}/${n}`, st);
+    let prev = null; try { prev = await store.get('state', key); } catch (e) { /* nothing there yet */ }
+    const prevMeta = (state.config.meta[id] || {})[n] || null;
+    await store.put('state', key, st);
     const c = document.createElement('canvas'); c.width = 120; c.height = 80;
     c.getContext('2d').drawImage(R.canvas, 0, 0, 120, 80);
-    const thumb = c.toDataURL('image/jpeg', 0.7), id = state.id;
-    updateConfig((cf) => { (cf.meta[id] = cf.meta[id] || {})[n] = { t: Date.now(), thumb }; cf.settings.slot = n; });
-    set({ flash: Date.now() }); toast(`Saved to slot ${n}`);
+    const thumb = c.toDataURL('image/jpeg', 0.7);
+    updateConfig((cf) => { (cf.meta[id] = cf.meta[id] || {})[n] = { t: Date.now(), thumb }; });   // saving to a slot never changes the quick slot
+    set({ flash: Date.now() });
+    toast(`Saved to slot ${n}`, { label: 'Undo', fn: () => undoSave(id, n, prev, prevMeta) });
   } catch (e) { toast('Could not store state: ' + e.message); }
 }
-async function loadState(n) {
+async function undoSave(id, n, prev, prevMeta) {   // put back whatever the slot held before
+  try {
+    if (prev) await store.put('state', `${id}/${n}`, prev); else await store.del('state', `${id}/${n}`);
+    updateConfig((cf) => { const m = (cf.meta[id] = cf.meta[id] || {}); if (prevMeta) m[n] = prevMeta; else delete m[n]; });
+    toast(`Slot ${n} restored`);
+  } catch (e) { toast('Could not undo: ' + e.message); }
+}
+async function loadState(n = curSlot()) {
   if (!state.running) return;
   try {
     const st = await store.get('state', `${state.id}/${n}`);
     if (!st) { toast(`Slot ${n} is empty`); return; }
-    if (Core.stateLoad(st)) { updateConfig((c) => { c.settings.slot = n; }); toast(`Loaded slot ${n}`); stepFrame(); draw(); set({ flash: Date.now() }); } else toast('State does not match this game');
+    const before = Core.stateSave();                 // safety net: Undo comes back to exactly here
+    if (Core.stateLoad(st)) {
+      stepFrame(); draw(); set({ flash: Date.now() });
+      toast(`Loaded slot ${n}`, before ? { label: 'Undo', fn: () => undoLoad(before) } : undefined);
+    } else toast('State does not match this game');
   } catch (e) { toast('Could not read state: ' + e.message); }
+}
+function undoLoad(snap) {
+  if (!state.running) return;
+  if (Core.stateLoad(snap)) { draw(); set({ flash: Date.now() }); toast('Back where you were'); } else toast('Could not undo');
 }
 function applyCheats(text, silent) {
   const id = state.id;
@@ -711,7 +740,15 @@ function setOverlay(on) {
   if (on && state.running && !state.paused) { set({ paused: true }); R.overlayPaused = true; }
   else if (!on && R.overlayPaused) { set({ paused: false }); R.overlayPaused = false; }
 }
-const screenshot = () => R.canvas.toBlob((b) => b && download(`${state.title || 'screenshot'}-${Date.now()}.png`, b));
+const screenshot = () => R.canvas.toBlob(async (b) => {
+  if (!b) return;
+  const name = `${state.title || 'screenshot'}-${Date.now()}.png`;
+  try {   // on phones the share sheet can save straight to Photos; a plain download lands in Files
+    const f = new File([b], name, { type: 'image/png' });
+    if (matchMedia('(pointer: coarse)').matches && navigator.canShare && navigator.canShare({ files: [f] })) { await navigator.share({ files: [f], title: name }); return; }
+  } catch (e) { if (e.name === 'AbortError') return; }
+  download(name, b);
+});
 const fullscreen = () => (document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen?.());
 async function setBios(file) {
   const b = new Uint8Array(await file.arrayBuffer());
@@ -795,7 +832,8 @@ window.GBA = {
   setNav: (active, handler) => { R.nav = { active, handler }; },   // the UI tells the engine when a menu layer is open
   setMenu: (fn) => { R.menuCb = fn; },                              // called on Select + Start
   setBios, clearBios, exportBackup, importBackup, touchSet,
-  _debug: () => ({ level: R.level, turbo: state.turbo, frames: R.frames, nav: R.nav.active }),
+  dismissToast: () => set({ toast: null }),
+  _debug: () => ({ level: R.level, turbo: state.turbo, frames: R.frames, nav: R.nav.active, touch: R.touch }),
   _import: importFiles, _store: store, _core: Core,   // test hooks
 };
 })();

@@ -11,6 +11,11 @@ const ICON = {
   gear: '<path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/>',
   close: '<path d="M6 6l12 12M18 6L6 18"/>',
   upload: '<path d="M12 16V5M7.5 9.5L12 5l4.5 4.5M5 19h14"/>',
+  grid: '<rect x="4" y="4" width="7" height="7" rx="1.8"/><rect x="13" y="4" width="7" height="7" rx="1.8"/><rect x="4" y="13" width="7" height="7" rx="1.8"/><rect x="13" y="13" width="7" height="7" rx="1.8"/>',
+  shot: '<path d="M4 8.5h3.2L9 6h6l1.8 2.5H20V19H4z"/><circle cx="12" cy="13.2" r="3.2"/>',
+  turbo: '<path d="M5 6.5l6.5 5.5L5 17.5zM13 6.5l6.5 5.5-6.5 5.5z"/>',
+  save: '<path d="M5 4h11l3 3v13H5z"/><path d="M8 4v5h7V4"/><path d="M8 20v-6h8v6"/>',
+  load: '<path d="M12 4v10M7.5 10l4.5 4.5 4.5-4.5M5 19h14"/>',
 };
 const Icon = ({ n, size = 20 }) => html`<svg viewBox="0 0 24 24" width=${size} height=${size} fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" dangerouslySetInnerHTML=${{ __html: ICON[n] }} />`;
 
@@ -77,7 +82,6 @@ const Toggle = ({ on, onChange, label, hint }) => html`
     <button type="button" ...${N} role="switch" aria-checked=${on} aria-label=${label} className=${'sw' + (on ? ' on' : '')} onClick=${() => onChange(!on)}><i /></button></div>`;
 const Field = ({ label, children, value }) => html`<div className="field"><div className="fl"><span>${label}</span>${value !== undefined && html`<b>${value}</b>`}</div>${children}</div>`;
 
-/* ----------------------------------------------------------------------------------- stage */
 function ControlsList({ s }) {
   const c = s.config, pad = s.pad.connected && s.input === 'pad', fam = s.pad.family;
   const L = (a) => (pad ? padLabel(c.pad[a], fam) : keyLabel(c.keys[a]));
@@ -98,36 +102,107 @@ function ControlsList({ s }) {
     ${rows.map(([k, v]) => html`<div className="cr" key=${k}><span>${k}</span><b>${v}</b></div>`)}
   </aside>`;
 }
-function Stage({ s }) {
+const isTouchUI = (c) => c.settings.touch === 'on' || (c.settings.touch === 'auto' && matchMedia('(pointer: coarse)').matches);
+const buzz = (ms = 8) => { try { if (GBA.getState().config.settings.vibrate && navigator.vibrate) navigator.vibrate(ms); } catch (e) { /* not supported (iPhone) */ } };
+
+/* One press button: pointer capture keeps a held button held even if the thumb drifts. */
+function PBtn({ k, label, cls }) {
+  const bit = GBA.BTN[k];
+  const up = (e) => { e.currentTarget.classList.remove('down'); GBA.touchSet(bit, false); };
+  return html`<button type="button" className=${cls} aria-label=${k}
+    onPointerDown=${(e) => { e.preventDefault(); e.currentTarget.setPointerCapture(e.pointerId); e.currentTarget.classList.add('down'); GBA.touchSet(bit, true); buzz(); }}
+    onPointerUp=${up} onPointerCancel=${up} onLostPointerCapture=${up} onContextMenu=${(e) => e.preventDefault()}>${label}</button>`;
+}
+/* The classic cross, but ONE touch surface: slide your thumb across it, or press between arms for a diagonal. */
+function Dpad() {
+  const ref = useRef(), bits = useRef(0), ptr = useRef(null), [dir, setDir] = useState(0);
+  const B = GBA.BTN, DIRS = ['UP', 'DOWN', 'LEFT', 'RIGHT'];
+  const apply = (e) => {
+    const r = ref.current.getBoundingClientRect(), dx = e.clientX - (r.left + r.width / 2), dy = e.clientY - (r.top + r.height / 2), d = Math.hypot(dx, dy);
+    let b = 0;
+    if (d > r.width * 0.12) {                       // small dead zone in the middle
+      const ax = Math.abs(dx) / d, ay = Math.abs(dy) / d;
+      if (ax > 0.38) b |= dx > 0 ? B.RIGHT : B.LEFT;   // within ~22 degrees of an axis = straight, otherwise diagonal
+      if (ay > 0.38) b |= dy > 0 ? B.DOWN : B.UP;
+    }
+    if (b === bits.current) return;
+    for (const k of DIRS) if ((b & B[k]) !== (bits.current & B[k])) GBA.touchSet(B[k], !!(b & B[k]));
+    if (b & ~bits.current) buzz(6);
+    bits.current = b; setDir(b);
+  };
+  const end = (e) => { if (ptr.current !== null && e && e.pointerId !== undefined && e.pointerId !== ptr.current) return; ptr.current = null; for (const k of DIRS) GBA.touchSet(B[k], false); bits.current = 0; setDir(0); };
+  const arm = (m) => (dir & m ? 'on' : '');
+  return html`<div className="dpad" ref=${ref} aria-label="D-pad"
+    onPointerDown=${(e) => { if (ptr.current !== null) return; e.preventDefault(); ptr.current = e.pointerId; ref.current.setPointerCapture(e.pointerId); apply(e); }}
+    onPointerMove=${(e) => { if (e.pointerId === ptr.current) apply(e); }}
+    onPointerUp=${end} onPointerCancel=${end} onLostPointerCapture=${end} onContextMenu=${(e) => e.preventDefault()}>
+    <svg viewBox="0 0 100 100" aria-hidden="true">
+      <polygon className="cross" points="33,1 67,1 67,33 99,33 99,67 67,67 67,99 33,99 33,67 1,67 1,33 33,33" />
+      <path className=${'hl ' + arm(B.UP)} d="M33 1h34v32H33z" /><path className=${'hl ' + arm(B.DOWN)} d="M33 67h34v32H33z" />
+      <path className=${'hl ' + arm(B.LEFT)} d="M1 33h32v34H1z" /><path className=${'hl ' + arm(B.RIGHT)} d="M67 33h32v34H67z" />
+      <path className=${'tri ' + arm(B.UP)} d="M50 9l9 13H41z" /><path className=${'tri ' + arm(B.DOWN)} d="M50 91l9-13H41z" />
+      <path className=${'tri ' + arm(B.LEFT)} d="M9 50l13-9v18z" /><path className=${'tri ' + arm(B.RIGHT)} d="M91 50l-13-9v18z" />
+    </svg></div>`;
+}
+function TouchUI() {
+  return html`<div className="touch">
+    <${PBtn} k="L" label="L" cls="L" /><${PBtn} k="R" label="R" cls="R" />
+    <div className="pad"><${Dpad} />
+      <div className="mid"><${PBtn} k="SELECT" label="Select" cls="sel" /><${PBtn} k="START" label="Start" cls="sta" /></div>
+      <div className="face"><${PBtn} k="B" label="B" cls="B" /><${PBtn} k="A" label="A" cls="A" /></div></div></div>`;
+}
+function TB({ icon, label, sub, onClick, on, cls = '', color }) {
+  return html`<button type="button" className=${'tbb ' + cls + (on ? ' on' : '')} style=${{ '--c': color }} aria-label=${label} aria-pressed=${on === undefined ? undefined : !!on}
+    onClick=${() => { buzz(12); onClick(); }}><${Icon} n=${icon} size=${22} /><span>${label}${sub ? html`<em>${sub}</em>` : ''}</span></button>`;
+}
+function Toolbar({ s, onSettings }) {
+  const c = s.config.settings;
+  return html`<div className="tb" role="toolbar" aria-label="Quick actions">
+    <${TB} icon="shot" label="Screenshot" color="#ff9f43" onClick=${() => GBA.screenshot()} />
+    <${TB} icon="turbo" label="Turbo" sub=${s.turbo ? ` ${c.turboSpeed}x` : ''} color="#ffd84a" on=${s.turbo} onClick=${() => GBA.setTurbo(!s.turbo)} />
+    <${TB} icon="gear" label="Settings" cls="gearp" color="#d6d6e6" onClick=${onSettings} />
+    <${TB} icon="save" label=${'Save ' + c.slot} color="#3ddc84" onClick=${() => GBA.saveState()} />
+    <${TB} icon="load" label=${'Load ' + c.slot} color="#4aa8ff" onClick=${() => GBA.loadState()} />
+  </div>`;
+}
+function Topbar({ s, onGames }) {
+  const c = s.config.settings;
+  return html`<div className="topbar"><button type="button" className="gamesbtn" onClick=${onGames} aria-label="Games"><${Icon} n="grid" size=${18} /> Games</button>
+    <span className="stat">${s.paused ? 'Paused \u00B7 ' : ''}${s.fps} fps \u00B7 slot ${c.slot}${s.turbo ? ` \u00B7 turbo ${c.turboSpeed}x` : ''}</span><span className="sp" /></div>`;
+}
+function Stage({ s, touch, onGames, onSettings }) {
   const ref = useRef();
   useEffect(() => GBA.attachCanvas(ref.current), []);
-  const { filter, scale, glow, turboSpeed, slot } = s.config.settings;
+  const { filter, scale, glow, turboSpeed, slot, toolbar } = s.config.settings;
   const w = scale === 'fit' ? 'min(94cqw, calc((100vh - 130px) * 1.5))' : `min(94cqw, ${240 * +scale}px)`;
+  const bar = touch && html`<${Toolbar} s=${s} onSettings=${onSettings} />`;
   return html`
     <main className=${'stage' + (s.running ? ' live' : '') + (s.paused ? ' paused' : '')} data-filter=${filter}>
       <div className=${'glow' + (glow ? '' : ' off')} />
       <div className="col" style=${{ '--w': w }}>
-        <div className="screen">
-          <canvas ref=${ref} width="240" height="160" aria-label="Game screen" />
-          <div className="lcd" />
-          <div className="flash" key=${s.flash} />
+        ${toolbar === 'top' && bar}
+        <div className="screenwrap">
+          <div className="screen">
+            <canvas ref=${ref} width="240" height="160" aria-label="Game screen" />
+            <div className="lcd" />
+            <div className="flash" key=${s.flash} />
+          </div>
+          ${touch && html`<button type="button" className="corner l" aria-label="Games" onClick=${onGames}><${Icon} n="grid" size=${18} /></button>
+            <button type="button" className="corner r" aria-label="Settings" onClick=${onSettings}><${Icon} n="gear" size=${18} /></button>`}
         </div>
-        <div className="under">${s.running ? `${s.paused ? 'Paused \u00B7 ' : ''}${s.fps} fps${s.turbo ? ` \u00B7 turbo ${turboSpeed}x` : ''} \u00B7 slot ${slot}` : '\u00A0'}</div>
+        ${toolbar !== 'top' && bar}
+        ${!touch && html`<div className="under">${s.running ? `${s.paused ? 'Paused \u00B7 ' : ''}${s.fps} fps${s.turbo ? ` \u00B7 turbo ${turboSpeed}x` : ''} \u00B7 slot ${slot}` : '\u00A0'}</div>`}
       </div>
     </main>`;
 }
-function Touch() {
-  const mk = (k, label, cls = '') => {
-    const up = (e) => { e.currentTarget.classList.remove('down'); GBA.touchSet(GBA.BTN[k], false); };
-    return html`<button type="button" className=${cls} aria-label=${k}
-      onPointerDown=${(e) => { e.preventDefault(); e.currentTarget.setPointerCapture(e.pointerId); e.currentTarget.classList.add('down'); GBA.touchSet(GBA.BTN[k], true); }}
-      onPointerUp=${up} onPointerCancel=${up} onLostPointerCapture=${up} onContextMenu=${(e) => e.preventDefault()}>${label}</button>`;
-  };
-  return html`<div className="touch">
-    <div className="sh">${mk('L', 'L')}${mk('R', 'R')}</div>
-    <div className="dp">${mk('UP', '\u25B2', 'u')}${mk('LEFT', '\u25C0', 'l')}${mk('RIGHT', '\u25B6', 'r')}${mk('DOWN', '\u25BC', 'd')}</div>
-    <div className="mid">${mk('SELECT', 'Select')}${mk('START', 'Start')}</div>
-    <div className="face">${mk('B', 'B')}${mk('A', 'A')}</div></div>`;
+
+const isIOS = () => /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const isStandalone = () => !!navigator.standalone || matchMedia('(display-mode: standalone)').matches;
+function IosHint() {
+  const [hide, setHide] = useState(() => { try { return !!localStorage.getItem('webgba.iosHint'); } catch (e) { return false; } });
+  if (hide || !isIOS() || isStandalone()) return null;
+  return html`<div className="ioshint"><span>iPhone tip: tap Share, then Add to Home Screen. It hides the address bar, and Safari can clear saved data from sites you haven't opened for a week, which Home Screen apps are exempt from.</span>
+    <button type="button" className="btn ghost" onClick=${() => { try { localStorage.setItem('webgba.iosHint', '1'); } catch (e) { /* ignore */ } setHide(true); }}>Got it</button></div>`;
 }
 
 /* --------------------------------------------------------------------- games (frosted glass) */
@@ -149,6 +224,7 @@ function GamesLayer({ s, onClose, onSettings }) {
             <input ref=${input} type="file" accept=".gba,.agb,.bin,.mb,.zip" hidden onChange=${(e) => { const f = e.target.files[0]; e.target.value = ''; if (f) { onClose(); GBA.openFile(f); } }} />
           </div>
         </header>
+        <${IosHint} />
         ${n > 0 && html`<div className="grid">${s.library.map((g, i) => {
           const cover = s.config.covers[g.name], cur = s.running && g.name === s.romName;
           return html`<div className=${'card' + (cur ? ' cur' : '')} key=${g.name} style=${{ '--h': hue(g.name), '--i': Math.min(i, 14) }}>
@@ -171,7 +247,7 @@ function GamesLayer({ s, onClose, onSettings }) {
 function SlotCard({ n, s }) {
   const m = (s.config.meta[s.id] || {})[n], cur = s.config.settings.slot === n;
   return html`<div className=${'slot' + (cur ? ' cur' : '')}><div className="thumb" style=${m ? { backgroundImage: `url(${m.thumb})` } : null}>${m ? '' : 'Empty'}</div>
-    <div className="sm"><b>Slot ${n}${cur ? ' \u00B7 active' : ''}</b><span>${m ? new Date(m.t).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : ''}</span></div>
+    <div className="sm"><b>Slot ${n}${cur ? ' \u00B7 quick' : ''}</b><span>${m ? new Date(m.t).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : ''}</span></div>
     <div className="sb"><button type="button" ...${N} disabled=${!s.running} onClick=${() => GBA.saveState(n)}>Save</button>
     <button type="button" ...${N} disabled=${!m || !s.running} onClick=${() => GBA.loadState(n)}>Load</button></div></div>`;
 }
@@ -187,7 +263,8 @@ function GameTab({ s }) {
       <button type="button" ...${N} className="btn" onClick=${GBA.fullscreen}>Fullscreen</button></div>
     <h3>Save states</h3>
     <div className="slots">${[1, 2, 3, 4].map((n) => html`<${SlotCard} key=${n} n=${n} s=${s} />`)}</div>
-    <p className="hint">Quick save and load use the active slot. Keys <kbd>1</kbd>-<kbd>4</kbd> load, <kbd>Shift</kbd>+<kbd>1</kbd>-<kbd>4</kbd> save.</p>
+    <${Field} label="Quick slot (Save / Load buttons, hotkeys, controller)"><${Seg} value=${String(s.config.settings.slot)} options=${[['1', '1'], ['2', '2'], ['3', '3'], ['4', '4']]} onChange=${(v) => setS('slot', +v)} /><//>
+    <p className="hint">Keys <kbd>1</kbd>-<kbd>4</kbd> load a specific slot and <kbd>Shift</kbd>+<kbd>1</kbd>-<kbd>4</kbd> save to it. Saving here never changes your quick slot.</p>
     <h3>Battery save</h3>
     <div className="btnrow"><button type="button" ...${N} className="btn" disabled=${!s.running} onClick=${GBA.exportSav}>Export .sav</button>
       <button type="button" ...${N} className="btn" disabled=${!s.running} onClick=${() => sav.current.click()}>Import .sav</button>
@@ -232,6 +309,12 @@ function ControlsTab({ s }) {
     <p className="hint"><kbd>Esc</kbd> opens the game list. Press a key then the new one; Esc cancels.</p>
     <h3>Touch</h3>
     <${Field} label="On-screen controls"><${Seg} value=${c.settings.touch} options=${[['auto', 'Auto'], ['on', 'Always'], ['off', 'Never']]} onChange=${(v) => setS('touch', v)} /><//>
+    ${isTouchUI(c) && html`<div>
+      <${Field} label="Screenshot / Turbo / Save / Load row"><${Seg} value=${c.settings.toolbar} options=${[['middle', 'Under the screen'], ['top', 'Above the screen']]} onChange=${(v) => setS('toolbar', v)} /><//>
+      <${Field} label="Button size"><${Seg} value=${c.settings.btnSize} options=${[['normal', 'Normal'], ['large', 'Large']]} onChange=${(v) => setS('btnSize', v)} /><//>
+      <${Field} label="Game screen"><${Seg} value=${c.settings.screenFit} options=${[['fit', 'True shape'], ['stretch', 'Stretch to fill']]} onChange=${(v) => setS('screenFit', v)} /><//>
+      ${navigator.vibrate && html`<${Toggle} label="Vibrate on tap" on=${c.settings.vibrate} onChange=${(v) => setS('vibrate', v)} />`}
+    </div>`}
   </div>`;
 }
 function DisplayTab({ s }) {
@@ -325,19 +408,21 @@ function App() {
     addEventListener('keydown', on); return () => removeEventListener('keydown', on);
   }, []);
 
-  const touchOn = s.config.settings.touch === 'on' || (s.config.settings.touch === 'auto' && matchMedia('(pointer: coarse)').matches);
+  const touchOn = isTouchUI(s.config);
+  const openGames = () => { setTab(null); setLib(true); }, toggleSettings = () => setTab(tab ? null : 'game');
   const calm = idle && s.running && !showLib && !tab;
   return html`
-    <div className=${'app' + (s.running ? ' playing' : '') + (calm ? ' calm' : '') + (touchOn ? ' touchon' : '') + (tab ? ' side' : '')} data-input=${s.input}>
-      <${Stage} s=${s} />
-      ${s.running && html`<${ControlsList} s=${s} />`}
-      ${touchOn && s.running && !showLib && html`<${Touch} />`}
+    <div className=${'app' + (s.running ? ' playing' : '') + (calm ? ' calm' : '') + (touchOn ? ' touchon' : '') + (touchOn && s.config.settings.btnSize === 'large' ? ' large' : '') + (touchOn && s.config.settings.screenFit === 'stretch' ? ' stretch' : '') + (tab ? ' side' : '')} data-input=${s.input}>
+      <${Stage} s=${s} touch=${touchOn} onGames=${openGames} onSettings=${toggleSettings} />
+      ${s.running && !touchOn && html`<${ControlsList} s=${s} />`}
+      ${touchOn && s.running && html`<${Topbar} s=${s} onGames=${openGames} />`}
+      ${touchOn && s.running && !showLib && html`<${TouchUI} />`}
       <button type="button" className="gear" aria-label="Settings" title="Settings" onClick=${() => setTab(tab ? null : 'game')}><${Icon} n="gear" size=${20} /></button>
       <${Drawer} open=${!!tab} tab=${tab || 'game'} setTab=${setTab} onClose=${() => setTab(null)} s=${s} />
       ${showLib && html`<${GamesLayer} s=${s} onClose=${() => setLib(false)} onSettings=${() => setTab('game')} />`}
       ${s.dragging && html`<div className="dropveil"><p>Drop to play</p></div>`}
       ${!s.ready && html`<div className="loading">Starting emulator...</div>`}
-      ${s.toast && html`<div className="toast" key=${s.toast.id} role="status">${s.toast.msg}</div>`}
+      ${s.toast && html`<div className=${'toast' + (s.toast.action ? ' act' : '')} key=${s.toast.id} role="status" style=${s.toast.action ? { animationDuration: '6s' } : null}><span>${s.toast.msg}</span>${s.toast.action && html`<button type="button" className="tact" onClick=${() => { const a = s.toast.action; GBA.dismissToast(); a.fn(); }}>${s.toast.action.label}</button>`}</div>`}
     </div>`;
 }
 ReactDOM.createRoot(document.getElementById('root')).render(html`<${App} />`);
